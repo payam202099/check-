@@ -1,0 +1,584 @@
+
+import os
+import json
+import hashlib
+import requests
+import torch
+import numpy as np
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+from dotenv import load_dotenv
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    TextIteratorStreamer,
+    BitsAndBytesConfig,
+    pipeline,
+    AutoModel
+)
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock, RLock
+from functools import lru_cache
+import logging
+import re
+import time
+import uuid
+from queue import Queue
+from threading import Thread
+import psutil
+from prometheus_client import start_http_server, Summary, Gauge, Counter
+import signal
+from typing import Any, Callable
+from enum import Enum
+import sqlite3
+import atexit
+import redis
+load_dotenv("configs/.env")
+config = json.load(open("configs/system_config.json"))
+def setup_logging():
+    log_level = config['system'].get('log_level', 'INFO').upper()
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s - %(levelname)s - %(module)s - %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+REQUEST_TIME = Summary('request_processing_seconds', 'Time spent processing requests')
+API_REQUEST_TIME = Summary('api_request_processing_seconds', 'Time spent processing API requests')
+SYSTEM_CPU_USAGE = Gauge('system_cpu_usage_percent', 'CPU usage of the system')
+SYSTEM_MEMORY_USAGE = Gauge('system_memory_usage_percent', 'Memory usage of the system')
+TOTAL_REQUESTS = Counter('total_requests', 'Total number of requests')
+REQUEST_ERRORS = Counter('request_errors', 'Total number of request errors')
+MODEL_LOAD_TIME = Summary('model_load_seconds', 'Time spent loading model')
+class Telemetry:
+    def __init__(self, config):
+        self.enabled = config['telemetry'].get('enabled', False)
+        self.endpoint = config['telemetry'].get('metrics_endpoint')
+        self.interval = config['telemetry'].get('interval_seconds', 60)
+        self._thread = None
+        self._stop_event = False
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.metrics = []
+        if self.enabled:
+           self.start_metrics_server()
+    def start_metrics_server(self):
+      if self.enabled:
+         start_http_server(8000)
+         self.logger.info("Prometheus metrics server started on port 8000.")
+    def add_metric(self, name, value):
+        self.metrics.append({"name": name, "value": value})
+
+    def _send_metrics(self):
+         if not self.enabled:
+            return
+         try:
+             metrics_data = {
+                  "timestamp": datetime.utcnow().isoformat(),
+                  "metrics": self.metrics
+              }
+             self.logger.debug(f"Sending telemetry data: {metrics_data}")
+             response = requests.post(self.endpoint, json=metrics_data)
+             response.raise_for_status()
+         except requests.exceptions.RequestException as e:
+             self.logger.error(f"Failed to send metrics: {e}")
+         finally:
+             self.metrics = []
+    def _collect_system_metrics(self):
+        SYSTEM_CPU_USAGE.set(psutil.cpu_percent())
+        SYSTEM_MEMORY_USAGE.set(psutil.virtual_memory().percent)
+    def _telemetry_loop(self):
+        while not self._stop_event:
+            self._collect_system_metrics()
+            self._send_metrics()
+            time.sleep(self.interval)
+        self.logger.info("Telemetry thread stopped")
+    def start(self):
+       if self.enabled:
+            self._thread = Thread(target=self._telemetry_loop, daemon=True)
+            self._thread.start()
+            self.logger.info("Telemetry thread started")
+    def stop(self):
+        self._stop_event = True
+        if self._thread:
+            self._thread.join()
+        self.logger.info("Telemetry service shutdown complete")
+class CacheManager:
+    def __init__(self, config):
+        self.type = config['cache'].get('type', 'in_memory')
+        self.size_limit_mb = config['cache'].get('size_limit_mb', 256)
+        self.ttl_seconds = config['cache'].get('ttl_seconds', 3600)
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self._cache = None
+        self._init_cache()
+    def _init_cache(self):
+      if self.type == 'redis':
+          try:
+             redis_host = os.getenv('REDIS_HOST','localhost')
+             redis_port = int(os.getenv('REDIS_PORT','6379'))
+             redis_db = int(os.getenv('REDIS_DB',0))
+             redis_password = os.getenv('REDIS_PASSWORD', None)
+             self._cache = redis.Redis(host=redis_host, port=redis_port, db=redis_db,password=redis_password)
+             self._cache.ping()
+             self.logger.info("Redis cache initialized successfully")
+          except redis.exceptions.ConnectionError as e:
+              self.logger.error(f"Failed to connect to Redis: {e}. Falling back to in-memory cache.")
+              self.type = 'in_memory'
+              self._cache = {}
+      else:
+         self._cache = {}
+         self.logger.info("In-memory cache initialized.")
+      self.logger.debug(f"Using cache type: {self.type}")
+    def get(self, key: str) -> Optional[Any]:
+        if self.type == 'redis':
+            value = self._cache.get(key)
+            return json.loads(value) if value else None
+        if key in self._cache:
+            item = self._cache[key]
+            if datetime.utcnow() < item['expiration']:
+                return item['value']
+            else:
+               del self._cache[key]
+               return None
+        return None
+    def set(self, key: str, value: Any):
+        if self.type == 'redis':
+            self._cache.set(key, json.dumps(value),ex = self.ttl_seconds)
+            return
+        expiration = datetime.utcnow() + timedelta(seconds=self.ttl_seconds)
+        self._cache[key] = {'value': value, 'expiration': expiration}
+        self._enforce_size_limit()
+    def _enforce_size_limit(self):
+        if self.type == 'redis':
+            return
+        total_size_mb = sum(len(str(item)) for item in self._cache.values())/ (1024 * 1024)
+        if total_size_mb > self.size_limit_mb:
+            sorted_items = sorted(self._cache.items(), key=lambda item: item[1]['expiration'])
+            to_delete = len(self._cache) - (total_size_mb < self.size_limit_mb)
+            for key, _ in sorted_items[:to_delete]:
+              del self._cache[key]
+            self.logger.warning(f"Cache size exceeded. Cleaned up {to_delete} old entries.")
+    def clear(self):
+      if self.type == 'redis':
+         self._cache.flushdb()
+      else:
+        self._cache = {}
+      self.logger.info("Cache cleared.")
+class RateLimiter:
+    def __init__(self, config):
+      self.requests_per_minute = config['rate_limiting'].get('requests_per_minute', 100)
+      self.api_requests_per_minute = config['rate_limiting'].get('api_requests_per_minute', 50)
+      self.user_request_tracking = config['rate_limiting'].get('user_request_tracking', True)
+      self.request_history = {}
+      self.api_request_history = []
+      self.lock = Lock()
+      self.logger = logging.getLogger(self.__class__.__name__)
+    def check_user_rate_limit(self, user_id: str):
+      if not self.user_request_tracking:
+        return True
+      with self.lock:
+        now = datetime.utcnow()
+        if user_id not in self.request_history:
+            self.request_history[user_id] = []
+        self.request_history[user_id] = [
+            ts for ts in self.request_history[user_id]
+            if now - ts < timedelta(minutes=1)
+        ]
+        if len(self.request_history[user_id]) >= self.requests_per_minute:
+           self.logger.warning(f"User {user_id} rate limit exceeded. {len(self.request_history[user_id])}/{self.requests_per_minute} requests in last minute.")
+           return False
+        self.request_history[user_id].append(now)
+        return True
+    def check_api_rate_limit(self):
+      with self.lock:
+          now = datetime.utcnow()
+          self.api_request_history = [
+              ts for ts in self.api_request_history
+              if now - ts < timedelta(minutes=1)
+          ]
+          if len(self.api_request_history) >= self.api_requests_per_minute:
+            self.logger.warning(f"API rate limit exceeded: {len(self.api_request_history)}/{self.api_requests_per_minute} requests in last minute.")
+            return False
+          self.api_request_history.append(now)
+          return True
+class DataMasker:
+    def __init__(self, config):
+      self.enabled = config['security']['data_masking'].get('enabled', True)
+      self.pii_regex = config['security']['data_masking'].get('pii_regex', [])
+      self.mask_token = config['security']['data_masking'].get('mask_token', '[MASKED]')
+      self.logger = logging.getLogger(self.__class__.__name__)
+    def mask_data(self, text: str) -> str:
+        if not self.enabled:
+           return text
+        masked_text = text
+        for regex in self.pii_regex:
+           masked_text = re.sub(regex, self.mask_token, masked_text)
+        self.logger.debug(f"Masked data: {text} -> {masked_text}")
+        return masked_text
+class Firewall:
+    def __init__(self, config):
+        self.enabled = config['security']['firewall'].get('enabled', True)
+        self.allowed_ips = config['security']['firewall'].get('allowed_ips', [])
+        self.denied_ips = config['security']['firewall'].get('denied_ips', [])
+        self.logger = logging.getLogger(self.__class__.__name__)
+    def is_allowed(self, ip_address: str) -> bool:
+       if not self.enabled:
+         return True
+       if ip_address in self.denied_ips:
+          self.logger.warning(f"Connection attempt from denied IP address: {ip_address}")
+          return False
+       if not self.allowed_ips:
+          return True # no specific allowed IP
+       if ip_address in self.allowed_ips:
+          return True
+       self.logger.warning(f"Connection attempt from unauthorized IP address: {ip_address}")
+       return False
+class QuantumSecurity:
+    def __init__(self, config):
+        self.key = os.getenv("QUANTUM_SEED").encode()
+        self.hashing_algo_name = config['security'].get('hashing', 'sha3_512')
+        self.key_derivation_iterations = config['security'].get('key_derivation_iterations', 210000)
+        self.encryption_protocol = config['security']['encryption'].get('protocol', 'AES-256-GCM')
+        self.key_rotation = config['security']['encryption'].get('key_rotation', 'weekly')
+        self.cipher_lock = RLock()
+        self.hashing_algo = self._get_hashing_algo(self.hashing_algo_name)
+        self.logger = logging.getLogger(self.__class__.__name__)
+    def _get_hashing_algo(self, algo_name):
+      if algo_name == 'sha3_512':
+        return hashlib.sha3_512
+      elif algo_name == 'sha256':
+          return hashlib.sha256
+      else:
+         self.logger.error(f"Unsupported hashing algorithm: {algo_name}")
+         return hashlib.sha3_512 # default back to sha3_512
+    def generate_hash(self, data: str) -> str:
+        return self.hashing_algo(data.encode()).hexdigest()
+    def encrypt(self, plaintext: str) -> Tuple[bytes, bytes]:
+        with self.cipher_lock:
+            cipher = AES.new(self.key, AES.MODE_GCM)
+            ciphertext, tag = cipher.encrypt_and_digest(pad(plaintext.encode(), AES.block_size))
+            self.logger.debug(f"Encrypted data: {plaintext} (truncated) with nonce {cipher.nonce.hex()}")
+            return ciphertext, cipher.nonce
+    def decrypt(self, ciphertext: bytes, nonce: bytes) -> str:
+        with self.cipher_lock:
+            cipher = AES.new(self.key, AES.MODE_GCM, nonce=nonce)
+            try:
+              plaintext = unpad(cipher.decrypt(ciphertext), AES.block_size).decode()
+              self.logger.debug(f"Decrypted data: (truncated) from ciphertext with nonce {nonce.hex()}")
+              return plaintext
+            except Exception as e:
+               self.logger.error(f"Decryption error:{e}")
+               return None
+class APIOracle:
+    def __init__(self, config):
+      self.config = config
+      self.logger = logging.getLogger(self.__class__.__name__)
+      self.cache = CacheManager(config)
+    @REQUEST_TIME.time()
+    def google_search(self, query: str) -> Optional[List[Dict]]:
+        if not self.config["apis"].get("google"):
+           self.logger.warning("Google API not configured.")
+           return None
+        api_key = os.getenv(self.config["apis"]["google"]["api_key_env"])
+        cx = os.getenv(self.config["apis"]["google"]["cx_env"])
+        url = self.config["apis"]["google"]["search"]
+        max_results = self.config["apis"]["google"]["max_results"]
+        cache_key = f"google_search_{self.cache.generate_hash(query)}"
+        cached_result = self.cache.get(cache_key)
+        if cached_result:
+            self.logger.debug(f"Retrieved google search result for '{query}' from cache.")
+            return cached_result
+        params = {
+            "key": api_key,
+            "cx": cx,
+            "q": query,
+            "num": max_results
+            }
+        try:
+           response = requests.get(url, params=params)
+           response.raise_for_status()
+           results = response.json().get('items',[])
+           self.cache.set(cache_key, results)
+           self.logger.debug(f"Google API search query for '{query}' returned {len(results)} results")
+           return results
+        except requests.exceptions.RequestException as e:
+             self.logger.error(f"Google search API error:{e}")
+             return None
+    @REQUEST_TIME.time()
+    def wolfram_alpha(self, query: str) -> Optional[Dict]:
+        if not self.config["apis"].get("wolfram"):
+           self.logger.warning("Wolfram Alpha API not configured.")
+           return None
+        api_key = os.getenv(self.config["apis"]["wolfram"]["api_key_env"])
+        base_url = self.config["apis"]["wolfram"]["endpoint"]
+        cache_key = f"wolfram_query_{self.cache.generate_hash(query)}"
+        cached_result = self.cache.get(cache_key)
+        max_retries = self.config["apis"]["wolfram"].get("max_retries", 3)
+        if cached_result:
+           self.logger.debug(f"Retrieved Wolfram Alpha result for '{query}' from cache.")
+           return cached_result
+        params = {
+           "appid": api_key,
+            "input": query,
+            "format": "json"
+        }
+        for attempt in range(max_retries):
+           try:
+              response = requests.get(base_url, params=params)
+              response.raise_for_status()
+              result = response.json()
+              if result.get('queryresult') and result['queryresult'].get('success'):
+                 self.cache.set(cache_key, result)
+                 self.logger.debug(f"Wolfram Alpha API query for '{query}' returned successfully.")
+                 return result
+              else:
+                self.logger.warning(f"Wolfram Alpha API query failed (attempt {attempt +1}): {result}")
+
+           except requests.exceptions.RequestException as e:
+               self.logger.error(f"Wolfram Alpha API Error (attempt {attempt +1}): {e}")
+               if attempt == max_retries - 1:
+                    return None
+           time.sleep(1)
+        return None
+    @REQUEST_TIME.time()
+    def github_graphql(self, query: str) -> Optional[Dict]:
+      if not self.config["apis"].get("github"):
+        self.logger.warning("Github API not configured.")
+        return None
+      token = os.getenv(self.config["apis"]["github"]["token_env"])
+      endpoint = self.config["apis"]["github"]["graphql_endpoint"]
+      cache_key = f"github_graphql_{self.cache.generate_hash(query)}"
+      cached_result = self.cache.get(cache_key)
+      if cached_result:
+        self.logger.debug(f"Retrieved github graphql for query from cache.")
+        return cached_result
+
+      headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+      try:
+        response = requests.post(endpoint, json={'query': query}, headers=headers)
+        response.raise_for_status()
+        result = response.json()
+        self.cache.set(cache_key, result)
+        self.logger.debug(f"Github graphQL query successful.")
+        return result
+      except requests.exceptions.RequestException as e:
+        self.logger.error(f"GitHub GraphQL API error: {e}")
+        return None
+    @REQUEST_TIME.time()
+    def huggingface_inference(self, model_name: str, inputs: str) -> Optional[Dict]:
+        if not self.config["apis"].get("huggingface"):
+            self.logger.warning("Hugging Face API not configured.")
+            return None
+        api_token = os.getenv(self.config["apis"]["huggingface"]["token_env"])
+        base_url = self.config["apis"]["huggingface"]["inference"]
+        cache_key = f"hf_inference_{model_name}_{self.cache.generate_hash(inputs)}"
+        cached_result = self.cache.get(cache_key)
+        headers = {"Authorization": f"Bearer {api_token}"} if api_token else {}
+        payload = {"inputs":inputs}
+        if cached_result:
+            self.logger.debug(f"Retrieved huggingface inference for model '{model_name}' from cache.")
+            return cached_result
+        try:
+            response = requests.post(f"{base_url}/{model_name}", headers=headers, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            self.cache.set(cache_key, result)
+            self.logger.debug(f"Huggingface inference for model '{model_name}' successful.")
+            return result
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Huggingface inference API error for '{model_name}': {e}")
+            return None
+class LinguisticProcessor:
+    def __init__(self, config):
+        self.config = config
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self.spell_model = pipeline("text2text-generation", model=config['linguistics']['spellcheck']['correction_model'])
+        self.ner_model = pipeline("ner", model=config['apis']['huggingface']['models']['ner'], aggregation_strategy="simple") if config["apis"].get("huggingface") else None
+        self.semantic_model = AutoModel.from_pretrained(config['linguistics']['semantic_analysis']['model'])  if config['linguistics']['semantic_analysis'].get("enabled",False) else None
+        self.tokenizer = AutoTokenizer.from_pretrained(config['linguistics']['semantic_analysis']['model']) if config['linguistics']['semantic_analysis'].get("enabled",False) else None
+        self.grammar_rules = config['linguistics']['grammar_rules']
+        self.spellcheck_config = config['linguistics']['spellcheck']
+        self.semantic_enabled = config['linguistics']['semantic_analysis'].get("enabled",False)
+        self.grammar_enabled = self.grammar_rules.get("enabled",False)
+    def correct_spelling(self, text: str) -> str:
+      if not self.spellcheck_config.get('auto_correct', True):
+         return text
+      try:
+        corrected_text = self.spell_model(text, max_length=512)[0]['generated_text']
+        self.logger.debug(f"Spelling corrected: {text} -> {corrected_text}")
+        return corrected_text
+      except Exception as e:
+           self.logger.error(f"Error correcting spelling:{e}")
+           return text
+    def analyze_grammar(self, text: str) -> List[str]:
+      if not self.grammar_enabled:
+         return []
+      self.logger.debug(f"Grammar analyzed: {text}")
+      return self.grammar_rules.get('style_guidelines',[])
+    def analyze_semantic(self, text:str)-> Optional[torch.Tensor]:
+        if not self.semantic_enabled or not self.semantic_model:
+          return None
+        inputs = self.tokenizer(text,return_tensors='pt', truncation=True, padding = True)
+        with torch.no_grad():
+            outputs = self.semantic_model(**inputs)
+        self.logger.debug(f"Semantic analysis completed for '{text}'")
+        return outputs.last_hidden_state.mean(dim=1)
+    def extract_named_entities(self, text: str) -> Optional[List[Dict]]:
+       if not self.ner_model:
+         self.logger.warning("NER model is not configured.")
+         return None
+       try:
+         entities = self.ner_model(text)
+         self.logger.debug(f"Named entities extracted:{entities}")
+         return entities
+       except Exception as e:
+         self.logger.error(f"Error extracting named entities: {e}")
+         return None
+class MemoryVault:
+    def __init__(self, config):
+        self.max_history = config['system']['max_history']
+        self.history = []
+        self.user_profiles_path = config["user_settings"].get('user_profiles_path', 'user_profiles')
+        self.history_size = config["user_settings"].get('history_size', 500)
+        self.default_language = config["user_settings"].get("default_language", "fa")
+        self.default_tone = config["user_settings"].get("default_tone", "neutral")
+        self.profiles = self._load_user_profiles()
+        self.lock = RLock()
+        self.logger = logging.getLogger(self.__class__.__name__)
+        self._db_connection = self._setup_database()
+    def _setup_database(self):
+        db_path = os.path.join(self.user_profiles_path, "memory.db")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_history (
+                user_id TEXT NOT NULL,
+                timestamp DATETIME NOT NULL,
+                message TEXT NOT NULL,
+                is_user_message INTEGER NOT NULL,
+                PRIMARY KEY (user_id, timestamp)
+            )
+        """)
+        conn.commit()
+        return conn
+    def _load_user_profiles(self) -> Dict:
+       profiles = {}
+       Path(self.user_profiles_path).mkdir(parents=True, exist_ok=True)
+       for file in os.listdir(self.user_profiles_path):
+           if file.endswith(".json"):
+              try:
+                user_id = file[:-5] # remove .json extension
+                with open(os.path.join(self.user_profiles_path,file),'r') as f:
+                  profiles[user_id]= json.load(f)
+                self.logger.debug(f"Loaded user profile:{user_id}")
+              except Exception as e:
+                self.logger.error(f"Error loading user profile {file} :{e}")
+       return profiles
+    def _save_user_profile(self, user_id: str):
+      profile = self.profiles.get(user_id)
+      if not profile:
+        self.logger.warning(f"No profile to save for user:{user_id}")
+        return
+      file_path = os.path.join(self.user_profiles_path,f"{user_id}.json")
+      with open(file_path,'w') as f:
+        json.dump(profile,f)
+      self.logger.debug(f"Saved user profile for user: {user_id}")
+    def get_user_profile(self, user_id: str) -> Dict:
+      with self.lock:
+          if user_id in self.profiles:
+              return self.profiles[user_id]
+          self.profiles[user_id]= {
+              'language': self.default_language,
+              'tone': self.default_tone,
+              'settings':{}
+          }
+          self.logger.debug(f"Created new user profile: {user_id}")
+          return self.profiles[user_id]
+    def set_user_profile(self, user_id: str, profile_data: Dict):
+        with self.lock:
+          if user_id in self.profiles:
+            self.profiles[user_id].update(profile_data)
+            self._save_user_profile(user_id)
+            self.logger.debug(f"Updated user profile:{user_id}")
+          else:
+            self.profiles[user_id]= profile_data
+            self._save_user_profile(user_id)
+            self.logger.debug(f"Created user profile:{user_id}")
+    def add_message(self, user_id: str, message: str, is_user_message: bool):
+        with self.lock:
+            if len(self.history) > self.max_history:
+                self.history.pop(0)
+            timestamp = datetime.utcnow()
+            self.history.append({
+                "user_id": user_id,
+                "timestamp": timestamp,
+                "message": message,
+                "is_user_message": is_user_message
+            })
+            self._store_in_db(user_id, timestamp, message, is_user_message)
+            self.logger.debug(f"Added message for user: {user_id}")
+
+    def _store_in_db(self, user_id: str, timestamp: datetime, message: str, is_user_message: bool):
+        cursor = self._db_connection.cursor()
+        try:
+            cursor.execute("""
+                INSERT INTO user_history (user_id, timestamp, message, is_user_message) 
+                VALUES (?, ?, ?, ?)
+            """, (user_id, timestamp.isoformat(), message, int(is_user_message)))
+            self._db_connection.commit()
+        except sqlite3.Error as e:
+            self.logger.error(f"Failed to insert message into database: {e}")
+            self._db_connection.rollback()
+
+if __name__ == "__main__":
+    setup_logging()
+    telemetry = Telemetry(config)
+    cache_manager = CacheManager(config)
+    rate_limiter = RateLimiter(config)
+    data_masker = DataMasker(config)
+    firewall = Firewall(config)
+    quantum_security = QuantumSecurity(config)
+    api_oracle = APIOracle(config)
+    linguistic_processor = LinguisticProcessor(config)
+    memory_vault = MemoryVault(config)
+
+    telemetry.start()
+    print("Chat bot initialized. Type 'exit' to end the chat.")
+
+    user_id = "user_001"  # For simplicity, we use a static user ID
+
+    while True:
+        user_input = input("User: ")
+        
+        if user_input.lower() == 'exit':
+            print("Chat ended.")
+            break
+        
+        # Check rate limits
+        if not rate_limiter.check_user_rate_limit(user_id):
+            print("System: You have exceeded your rate limit. Please try again later.")
+            continue
+        
+        # Store user message
+        memory_vault.add_message(user_id, user_input, True)
+        
+        # Simple bot response logic (you'd replace this with more complex logic or AI)
+        if "hello" in user_input.lower():
+            response = "Hello! How can I assist you today?"
+        elif "how are you" in user_input.lower():
+            response = "I'm doing well, thanks for asking! How about you?"
+        else:
+            response = "I'm not sure how to respond to that. Can you elaborate?"
+
+        # Store bot's response
+        memory_vault.add_message(user_id, response, False)
+        
+        # Apply linguistic processing (this is a simplified example)
+        corrected_response = linguistic_processor.correct_spelling(response)
+        print(f"System: {corrected_response}")
+    print("System initialized and telemetry started.")
